@@ -1,0 +1,5 @@
+openid_store
+containers.json
+*.pyc
+database.sqlite3
+*.orig
