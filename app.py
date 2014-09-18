@@ -9,24 +9,37 @@ import time
 from unicodedata import normalize
 
 import docker
-from flask import Flask, render_template, session, g, redirect, url_for
+from flask import Flask, render_template, session, g, redirect, url_for, request, send_from_directory
 from flask.ext.bootstrap import Bootstrap
-from flask.ext.wtf import Form, TextField
+from flask.ext.wtf import Form, FileField, validators
+from wtforms.fields import TextAreaField
+from werkzeug import secure_filename
 
 import psutil
 import requests
+import tempfile
+
+from flask.ext.openid import OpenID
+import sqlite3dbm
 
 app = Flask(__name__)
+app.secret_key = "arglebargle"
+oid = OpenID(app, os.path.join(os.path.dirname(__file__), 'openid_store'))
+
+UPLOAD_FOLDER = tempfile.mkdtemp()
+MOUNTPOINT = '/blah'
+ALLOWED_EXTENSIONS = set(['py'])
 
 app.config['BOOTSTRAP_USE_MINIFIED'] = True
 app.config['BOOTSTRAP_USE_CDN'] = True
 app.config['BOOTSTRAP_FONTAWESOME'] = True
-app.config['SECRET_KEY'] = 'devkey'
+app.config['SECRET_KEY'] = app.secret_key
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 
 CONTAINER_STORAGE = "/usr/local/etc/jiffylab/webapp/containers.json"
 SERVICES_HOST = '127.0.0.1'
 BASE_IMAGE = 'ytproject/yt-devel'
-BASE_IMAGE_TAG = 'jiffylab'
+BASE_IMAGE_TAG = 'latest'
 
 initial_memory_budget = psutil.virtual_memory().free  # or can use available for vm
 
@@ -47,6 +60,13 @@ docker_client = docker.Client(base_url='unix://var/run/docker.sock',
 lock = threading.Lock()
 
 
+
+def allowed_file(filename):
+    return '.' in filename and \
+        filename.rsplit('.', 1)[1] in ALLOWED_EXTENSIONS
+        
+
+
 class ContainerException(Exception):
     """
     There was some problem generating or launching a docker container
@@ -54,18 +74,6 @@ class ContainerException(Exception):
     """
     pass
 
-
-class UserForm(Form):
-    # TODO use HTML5 email input
-    email = TextField('Email', description='Please enter your email address.')
-
-
-@app.before_request
-def get_current_user():
-    g.user = None
-    email = session.get('email')
-    if email is not None:
-        g.user = email
 
 _punct_re = re.compile(r'[\t !"#$%&\'()*\-/<=>?@\[\\\]^_`{|},.]+')
 
@@ -108,7 +116,7 @@ def check_memory():
     Check that we have enough memory "budget" to use for this container
 
     Note this is hard because while each container may not be using its full
-    memory limit amount, you have to consider it like a check written to your
+    emory limit amount, you have to consider it like a check written to your
     account, you never know when it may be cashed.
     """
     # the overbook factor says that each container is unlikely to be using its
@@ -190,7 +198,7 @@ def get_container(cont_id, all=False):
     return None
 
 
-def get_or_make_container(email):
+def get_or_make_container(email, filename):
     # TODO catch ConnectionError
     name = slugify(unicode(email)).lower()
     container_id = lookup_container(name)
@@ -198,10 +206,11 @@ def get_or_make_container(email):
         image = get_image()
         cont = docker_client.create_container(
                 image['Id'],
-                None,
+                ['python', os.path.join(MOUNTPOINT, filename)],
                 hostname="{user}box".format(user=name.split('-')[0]),
                 mem_limit=CONTAINER_MEM_LIMIT,
                 ports=[8888, 4200],
+                volumes=[MOUNTPOINT]
                 )
 
         remember_container(name, cont['Id'])
@@ -215,50 +224,101 @@ def get_or_make_container(email):
         print 'recurse'
         # recurse
         # TODO DANGER- could have a over-recursion guard?
-        return get_or_make_container(email)
+        return get_or_make_container(email, filename)
 
     if "Up" not in container['Status']:
         # if the container is not currently running, restart it
         check_memory()
-        docker_client.start(container_id, publish_all_ports=True)
+        docker_client.start(container_id,
+                            binds={UPLOAD_FOLDER: {"bind": MOUNTPOINT}},
+                            publish_all_ports=True)
         # refresh status
         container = get_container(container_id)
-    container = add_portmap(container)
-    return container
+    #container = add_portmap(container)
+    return name, container
 
 
 @app.route('/', methods=['GET', 'POST'])
+def upload_file():
+    if request.method == 'POST':
+        file = request.files['file']
+        if file and allowed_file(file.filename):
+            filename = secure_filename(file.filename)
+            file.save(os.path.join(app.config['UPLOAD_FOLDER'], filename))
+            return redirect(url_for('index', filename=filename))
+    return '''
+    <!doctype html>
+    <title>Upload new File</title>
+    <h1>Upload new File</h1>
+    <form action="" method=post enctype=multipart/form-data>
+      <p><input type=file name=file>
+         <input type=submit value=Upload>
+    </form>
+    '''
+
+@app.route('/main', methods=['GET', 'POST'])
 def index():
     try:
         container = None
-        form = UserForm()
         print g.user
         if g.user:
-            # show container:
-            container = get_or_make_container(g.user)
-        else:
-            if form.validate_on_submit():
-                g.user = form.email.data
-                session['email'] = g.user
-                container = get_or_make_container(g.user)
+            # return "hi user %(id)d (email %(email)s). <a href='/logout'>logout</a>" %(g.user)
+            name, container = get_or_make_container(g.user, request.values['filename'])
+            time.sleep(10)
+            forget_container(name)
+            return "%s" % docker_client.logs(container.get('Id'))
         return render_template('index.html',
                 container=container,
-                form=form,
+                filename=request.values['filename'],
                 servicehost=app.config['SERVICES_HOST'],
                 )
     except ContainerException as e:
-        session.pop('email', None)
+        session.pop('openid', None)
         return render_template('error.html', error=e)
+ 
 
-
+def open_db():
+    g.db = getattr(g, 'db', None) or sqlite3dbm.sshelve.open("database.sqlite3")
+ 
+def get_user():
+    open_db()
+    return g.db.get('oid-' + session.get('openid', ''))
+ 
+@app.before_request
+def set_user_if_logged_in():
+    open_db() # just to be explicit ...
+    g.user = get_user()
+ 
+@app.route("/login")
+@oid.loginhandler
+def login():
+    if g.user is not None:
+        return redirect(oid.get_next_url())
+    else:
+        return oid.try_login("https://www.google.com/accounts/o8/id",
+            ask_for=['email', 'fullname', 'nickname'])
+ 
+@oid.after_login
+def new_user(resp):
+    session['openid'] = resp.identity_url
+    if get_user() is None:
+        user_id = g.db.get('user-count', 0)
+        g.db['user-count'] = user_id + 1
+        g.db['oid-' + session['openid']] = {
+            'id': user_id,
+            'email': resp.email,
+            'fullname': resp.fullname,
+            'nickname': resp.nickname}
+    return redirect(oid.get_next_url())
+ 
 @app.route('/logout')
 def logout():
-    # remove the username from the session if it's there
-    session.pop('email', None)
-    return redirect(url_for('index'))
-
+    session.pop('openid', None)
+    return redirect(oid.get_next_url())
+ 
 
 if '__main__' == __name__:
+    oid = OpenID(app, '/tmp/openid_store', safe_roots=[])
     # app.run(debug=True, host='0.0.0.0')
     pass
 
