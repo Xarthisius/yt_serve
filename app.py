@@ -29,6 +29,7 @@ oid = OpenID(app, os.path.join(os.path.dirname(__file__), 'openid_store'))
 UPLOAD_FOLDER = tempfile.mkdtemp()
 MOUNTPOINT = '/blah'
 ALLOWED_EXTENSIONS = set(['py'])
+DATABASE = '/usr/local/etc/jiffylab/webapp/database.sqlite3'
 
 app.config['BOOTSTRAP_USE_MINIFIED'] = True
 app.config['BOOTSTRAP_USE_CDN'] = True
@@ -264,7 +265,7 @@ def index():
         if g.user:
             # return "hi user %(id)d (email %(email)s). <a href='/logout'>logout</a>" %(g.user)
             name, container = get_or_make_container(g.user, request.values['filename'])
-            time.sleep(10)
+            docker_client.wait(container.get('Id'))
             forget_container(name)
             return "%s" % docker_client.logs(container.get('Id'))
         return render_template('index.html',
@@ -278,7 +279,7 @@ def index():
  
 
 def open_db():
-    g.db = getattr(g, 'db', None) or sqlite3dbm.sshelve.open("database.sqlite3")
+    g.db = getattr(g, 'db', None) or sqlite3dbm.sshelve.open(DATABASE)
  
 def get_user():
     open_db()
