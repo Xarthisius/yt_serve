@@ -3,3 +3,4 @@ containers.json
 *.pyc
 database.sqlite3
 *.orig
+results/

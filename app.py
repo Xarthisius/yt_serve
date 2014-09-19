@@ -5,6 +5,8 @@ import json
 import os
 import re
 import threading
+import tarfile
+import StringIO
 from unicodedata import normalize
 
 import docker
@@ -15,6 +17,7 @@ from werkzeug import secure_filename
 
 import psutil
 import tempfile
+from dirlist_app import dirlist
 
 from flask.ext.openid import OpenID
 import sqlite3dbm
@@ -50,6 +53,7 @@ MEM_MIN = CONTAINER_MEM_LIMIT + 1024 * 1024 * 128
 app.config.from_object(__name__)
 app.config.from_envvar('FLASKAPP_SETTINGS', silent=True)
 
+app.register_blueprint(dirlist, url_prefix='/results')
 Bootstrap(app)
 
 docker_client = docker.Client(base_url='unix://var/run/docker.sock',
@@ -220,6 +224,11 @@ def upload_file():
     '''
 
 
+@app.route('/results', methods=['GET'])
+def get_results():
+    print "This should never be rendered"
+
+
 @app.route('/main', methods=['GET', 'POST'])
 def index():
     try:
@@ -230,9 +239,25 @@ def index():
             # href='/logout'>logout</a>" %(g.user)
             name, container = get_or_make_container(
                 g.user, request.values['filename'])
-            docker_client.wait(container.get('Id'))
+            cid = container.get('Id')
+            docker_client.wait(cid)
+            for fobj in docker_client.diff(cid):
+                print fobj['Path']
+                if re.search('.*\.png$', fobj['Path']):
+                    print "Found: ", fobj['Path']
+                    raw = docker_client.copy(cid, fobj['Path'])
+                    filelike = StringIO.StringIO(raw.read())
+                    tar = tarfile.open(fileobj=filelike)
+                    outfile = os.path.basename(fobj['Path'])
+                    file = tar.extractfile(outfile)
+                    with open(os.path.join('results', outfile), "wb") as fname:
+                        print "wrote %s" % os.path.join('results', outfile)
+                        fname.write(file.read())
+            with open(os.path.join('results', 'stdout.txt'), "wb") as fname:
+                fname.write(docker_client.logs(container.get('Id')))
+
             forget_container(name)
-            return "%s" % docker_client.logs(container.get('Id'))
+            return redirect(url_for('get_results'))
         return render_template('index.html',
                                container=container,
                                filename=request.values['filename'],
