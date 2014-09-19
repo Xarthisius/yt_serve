@@ -5,3 +5,5 @@ Flask-WTF>=0.8.3
 Flask-OpenID
 WTForms>=1.0.4
 psutil
+sqlite3dbm
+Flask-AutoIndex
